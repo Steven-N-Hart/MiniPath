@@ -13,9 +13,10 @@ def read_readme(filename):
 
 setup(
     name="minipath",
-    version="0.1.0",
+    version="0.1.1",
     description="A tool for processing and analyzing digital pathology images stored in DICOM format.",
     long_description=read_readme('README.md'),
+    long_description_content_type='text/markdown',
     author="Steven Hart",
     author_email="Hart.Steven@Mayo.edu",
     license="MIT",
