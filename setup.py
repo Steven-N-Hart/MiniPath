@@ -13,7 +13,7 @@ def read_readme(filename):
 
 setup(
     name="minipath",
-    version="0.1.2",
+    version="0.1.5",
     description="A tool for processing and analyzing digital pathology images stored in DICOM format.",
     long_description=read_readme('README.md'),
     long_description_content_type='text/markdown',

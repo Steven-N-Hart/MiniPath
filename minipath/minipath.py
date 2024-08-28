@@ -35,13 +35,13 @@ class MiniPath:
         else:
             img_to_use_at_low_mag = results_dict['patches_with_labels']
         self.img_to_use_at_low_mag = img_to_use_at_low_mag
-        self.low_res_dcm
+        self.low_res_dcm = dcm
 
 
     def get_high_res(self):
         mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv)
         clean_high_mag_frames = mag_pairs.clean_high_mag_frames
-        return clean_high_mag_frames[0].keys()
+        return clean_high_mag_frames
 
 
 def read_dicom(dcm_input):
