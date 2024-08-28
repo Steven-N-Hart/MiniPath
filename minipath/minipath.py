@@ -23,6 +23,7 @@ class MiniPath:
         self.subset = subset
         self.img_to_use_at_low_mag = None
         self.low_res_dcm = None
+        self.high_mag_dcm = None
 
     def get_representatives(self, full_url):
         dcm = read_dicomweb(full_url)
@@ -41,6 +42,7 @@ class MiniPath:
     def get_high_res(self):
         mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv)
         clean_high_mag_frames = mag_pairs.clean_high_mag_frames
+        self.high_mag_dcm = mag_pairs.high_mag_dcm
         return clean_high_mag_frames
 
 
