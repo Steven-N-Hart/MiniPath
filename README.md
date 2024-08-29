@@ -36,7 +36,14 @@ Replace `path/to/your/credentials.json` with the actual path to your Google Clou
 from minipath import MiniPath
 minipath = MiniPath(csv='path/to/csv_file.csv', subset=True)
 ```
-- **`csv`**: Path to a CSV file containing metadata and GCS URLs for high-magnification DICOM images.
+- **`csv`**: Path to a CSV file containing metadata and GCS URLs for high-magnification DICOM images. Requires the 
+  following columns:
+  - **gcs_url**: path to local ('path/to/file') or remote ('gs://') DICOM file or DICOMweb address ('https://')
+  - **SeriesInstanceUID**: Necessary to link together different resolutions of DICOM images
+  - **row_num_asc**: should have a 1 in this column if referring to the low magnification DICOM
+  - **row_num_desc**: should have a 1 in this column if referring to the high magnification DICOM
+  
+
 - **`subset`**: Boolean flag to decide if only a subset of diverse patches should be used. Defaults to True. If you 
   set it to false, all patches will be extracted.
 
