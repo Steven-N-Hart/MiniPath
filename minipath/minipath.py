@@ -194,12 +194,20 @@ class GetEntropy:
         :return: Optimal number of clusters.
         """
         num_unique_data_points = len(set(tuple(row) for row in features))
+        if num_unique_data_points == 1:
+            # If all data points are the same, only one cluster is optimal
+            return 1
+
         wcss = []
 
         for i in range(1, min(max_k, num_unique_data_points)):
             kmeans = KMeans(n_clusters=i, init='k-means++', max_iter=300, n_init=10, random_state=0)
             kmeans.fit(features)
             wcss.append(kmeans.inertia_)
+
+        if len(wcss) < 2:
+            # If we don't have enough WCSS values to calculate the elbow, return the minimum possible number of clusters
+            return 1
 
         distances = []
         for i in range(len(wcss)):
@@ -209,6 +217,10 @@ class GetEntropy:
             b = wcss[0]  # Intercept
             distance = abs(a * x - y + b) / np.sqrt(a ** 2 + 1)  # Distance formula from a point to a line
             distances.append(distance)
+
+        if not distances:
+            # If no distances were calculated, return the smallest number of clusters
+            return 1
 
         elbow_k = distances.index(max(distances)) + 1
 
