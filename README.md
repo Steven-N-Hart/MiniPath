@@ -36,6 +36,7 @@ Replace `path/to/your/credentials.json` with the actual path to your Google Clou
 from minipath import MiniPath
 minipath = MiniPath(csv='path/to/csv_file.csv', subset=True)
 ```
+#### Required Parameter
 - **`csv`**: Path to a CSV file containing metadata and GCS URLs for high-magnification DICOM images. Requires the 
   following columns:
   - **gcs_url**: path to local ('path/to/file') or remote ('gs://') DICOM file or DICOMweb address ('https://')
@@ -43,9 +44,43 @@ minipath = MiniPath(csv='path/to/csv_file.csv', subset=True)
   - **row_num_asc**: should have a 1 in this column if referring to the low magnification DICOM
   - **row_num_desc**: should have a 1 in this column if referring to the high magnification DICOM
   
-
-- **`subset`**: Boolean flag to decide if only a subset of diverse patches should be used. Defaults to True. If you 
+#### Optional Parameters
+- **`subset: bool = True`**: 
+  - Boolean flag to decide if only a subset of diverse patches should be used. Defaults to True. If you 
   set it to false, all patches will be extracted.
+
+- **`explained_variance: float = 0.8`**
+  - Threshold for cumulative explained variance in Principal Component Analysis (PCA).
+  - Determines how many principal components are kept based on the amount of variance they explain. A value of 0.8 means the components should explain at least 80% of the variance in the data.
+
+- **`img_size: int = 256`**
+  - The size to which the low-resolution image is resized for patch extraction.
+  - This option affects the resolution of the image before breaking it down into patches.
+
+- **`patch_size: int = 8`**
+  - The size of each patch to be extracted from the resized image.
+  - This option controls the granularity of the patches, where smaller sizes yield more patches per image.
+
+- **`min_k: int = 8`**
+  - The minimum number of clusters to be used in KMeans clustering.
+  - Ensures that at least a certain number of clusters are considered when determining the diversity of patches.
+- 
+- **`max_k: int = 50`**
+  - The maximum number of clusters to be tested during KMeans clustering.
+  - This option controls how many potential clusters will be used when identifying diverse patches.
+
+- **`km_init: str = 'k-means++'`**
+  - The initialization method used for KMeans clustering.
+  - The default value `'k-means++'` ensures better initialization for faster convergence and more reliable clustering results.
+
+- **`km_max_iter: int = 300`**
+  - Maximum number of iterations allowed for the KMeans algorithm.
+  - This setting ensures that KMeans stops after 300 iterations even if it hasn't converged to an optimal solution, preventing excessive computation.
+
+- **`km_n_init: int = 10`**
+  - The number of times the KMeans algorithm will be run with different centroid seeds.
+  - KMeans clustering is run multiple times with different initializations, and the best result (in terms of inertia) is kept. A higher value increases reliability at the cost of more computation.
+
 
 ### Get Representative Patches
 ```python
