@@ -6,14 +6,14 @@ import numpy as np
 import logging
 from PIL import Image
 import pydicom
+from pydicom.encaps import generate_pixel_data_frame
 import os
-from io import BytesIO
 from google.cloud import storage
 import pandas as pd
 from google.auth.transport.requests import AuthorizedSession
 import google.auth
 from typing import List, Optional, Dict
-
+import io
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -170,7 +170,7 @@ def read_dicom_from_gcs(gcs_path):
     dicom_bytes = blob.download_as_bytes()
 
     # Use pydicom to read the DICOM file from bytes
-    dicom_file = pydicom.dcmread(BytesIO(dicom_bytes))
+    dicom_file = pydicom.dcmread(io.BytesIO(dicom_bytes))
 
     return dicom_file
 
@@ -419,8 +419,13 @@ class MagPairs:
         Function to determine if a tile shows mainly tissue (foreground) or background.
         Returns True if tile shows <= 50% background and False otherwise.
         """
+        # If tile is in bytes, convert to image
+        if isinstance(tile, bytes):
+            tile = Image.open(io.BytesIO(tile))
+
         if isinstance(tile, np.ndarray):
             tile = Image.fromarray(tile)
+
         grey = tile.convert(mode='L')
         thresholded = grey.point(lambda x: 0 if x < 220 else 1, mode='F')
         avg_bkg = np.average(np.array(thresholded))
@@ -428,12 +433,31 @@ class MagPairs:
 
     @staticmethod
     def frame_extraction(dcm, high_mag_frame_list):
-        pixel_array = dcm.pixel_array
-        for high_mag_frame in high_mag_frame_list:
-            for j in high_mag_frame:
-                frame_id = j['frame']
-                j['img_array'] = pixel_array[frame_id]
-                yield j
+        try:
+            pixel_array = dcm.pixel_array
+            for high_mag_frame in high_mag_frame_list:
+                for j in high_mag_frame:
+                    frame_id = j['frame']
+                    j['img_array'] = pixel_array[frame_id]
+                    yield j
+        except MemoryError as e:
+            logging.warning("MemoryError: Failed to load the entire pixel array into memory, switching to "
+                            "frame-by-frame loading.")
+            # Generator for individual frames (works for encapsulated formats)
+            frame_generator = generate_pixel_data_frame(dcm.PixelData, dcm.NumberOfFrames)
+
+            for high_mag_frame in high_mag_frame_list:
+                for j in high_mag_frame:
+                    frame_id = j['frame']
+
+                    # Fetch specific frame data without loading the entire pixel array
+                    for i, frame_data in enumerate(frame_generator):
+                        if i == frame_id:
+                            if isinstance(frame_data, bytes):
+                                frame_data = Image.open(io.BytesIO(frame_data))
+                            j['img_array'] = frame_data  # Assign frame data to img_array
+                            yield j
+                            break
 
     @staticmethod
     def get_local_name(gcs_url, data_dir):
