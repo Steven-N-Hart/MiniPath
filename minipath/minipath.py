@@ -454,7 +454,8 @@ class MagPairs:
                     for i, frame_data in enumerate(frame_generator):
                         if i == frame_id:
                             if isinstance(frame_data, bytes):
-                                frame_data = Image.open(io.BytesIO(frame_data))
+                                img = Image.open(io.BytesIO(frame_data))
+                                frame_data = np.array(img)
                             j['img_array'] = frame_data  # Assign frame data to img_array
                             yield j
                             break
