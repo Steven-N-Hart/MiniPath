@@ -144,7 +144,7 @@ def read_dicomweb(dcm_input):
     headers = {"Accept": "application/dicom; transfer-syntax=*"}
     response = session.get(dcm_input, headers=headers)
     response.raise_for_status()
-    return pydicom.dcmread(BytesIO(response.content))
+    return pydicom.dcmread(io.BytesIO(response.content))
 
 
 def read_dicom_from_gcs(gcs_path):
