@@ -64,7 +64,7 @@ minipath = MiniPath(csv='path/to/csv_file.csv', subset=True)
 - **`min_k: int = 8`**
   - The minimum number of clusters to be used in KMeans clustering.
   - Ensures that at least a certain number of clusters are considered when determining the diversity of patches.
-- 
+    
 - **`max_k: int = 50`**
   - The maximum number of clusters to be tested during KMeans clustering.
   - This option controls how many potential clusters will be used when identifying diverse patches.
