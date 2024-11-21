@@ -423,13 +423,13 @@ class MagPairs:
         if isinstance(tile, bytes):
             tile = Image.open(io.BytesIO(tile))
 
-        if isinstance(tile, np.ndarray):
-            tile = Image.fromarray(tile)
+        if isinstance(tile, Image.Image):
+            tile = np.array(tile)  # Convert Pillow image to NumPy array
 
-        grey = tile.convert(mode='L')
-        thresholded = grey.point(lambda x: 0 if x < 220 else 1, mode='F')
-        avg_bkg = np.average(np.array(thresholded))
-        return avg_bkg <= 0.5
+        # Convert to grayscale and threshold
+        grey = np.mean(tile, axis=-1)
+        thresholded = grey < 220
+        return np.mean(thresholded) > 0.5  # True if more than 50% of the tile is foreground
 
     @staticmethod
     def frame_extraction(dcm, high_mag_frame_list):
