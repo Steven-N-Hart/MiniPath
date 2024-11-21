@@ -390,7 +390,7 @@ class GetEntropy:
 
 
 class MagPairs:
-    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, all_frames=False):
+    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, all_frames=False, patch_size=256):
         """
         Initialize MagPairs to extract corresponding high-magnification frames from a low-magnification DICOM image.
 
@@ -399,6 +399,7 @@ class MagPairs:
         :param bq_results_df: Dataframe containing bq_results for matching DICOM pairs.
         :param all_frames: Boolean to indicate whether to return all frames or just intersecting frames.
         """
+        self.patch_size = patch_size
         self.low_mag_dcm = read_dicom(low_mag_dcm)
         self.high_mag_dcm = read_dicom(self.get_local_dcm_pair(low_mag_dcm, bq_results_df))
         self.low_mag_img = get_single_dcm_img(self.low_mag_dcm)
@@ -419,17 +420,16 @@ class MagPairs:
         Function to determine if a tile shows mainly tissue (foreground) or background.
         Returns True if tile shows <= 50% background and False otherwise.
         """
-        # If tile is in bytes, convert to image
         if isinstance(tile, bytes):
-            tile = Image.open(io.BytesIO(tile))
+            tile = np.array(Image.open(io.BytesIO(tile)))
+        elif isinstance(tile, Image.Image):
+            tile = np.array(tile)
 
-        if isinstance(tile, np.ndarray):
-            tile = Image.fromarray(tile)
+            # Convert to grayscale and threshold
+        grey = np.mean(tile, axis=-1) if len(tile.shape) == 3 else tile
+        thresholded = grey < 220
+        return np.mean(thresholded) > 0.5  # True if more than 50% of the tile is foreground
 
-        grey = tile.convert(mode='L')
-        thresholded = grey.point(lambda x: 0 if x < 220 else 1, mode='F')
-        avg_bkg = np.average(np.array(thresholded))
-        return avg_bkg <= 0.5
 
     @staticmethod
     def frame_extraction(dcm, high_mag_frame_list):
@@ -479,19 +479,14 @@ class MagPairs:
         Returns:
         - List of dictionaries that intersect with the given coordinates.
         """
-        intersecting_frames = []
+        frame_array = np.array([[f['row_min'], f['row_max'], f['col_min'], f['col_max'], f['frame']] for f in fd])
+        if all_frames:
+            return fd  # Return all frames if no filtering is required
 
-        for frame_data in fd:
-            row_min = frame_data['row_min']
-            row_max = frame_data['row_max']
-            col_min = frame_data['col_min']
-            col_max = frame_data['col_max']
-
-            # Check for intersection in both x and y ranges
-            if (x_min <= col_max and x_max >= col_min) and (y_min <= row_max and y_max >= row_min) or all_frames:
-                intersecting_frames.append(frame_data)
-
-        return intersecting_frames
+        x_condition = (frame_array[:, 2] <= x_max) & (frame_array[:, 3] >= x_min)
+        y_condition = (frame_array[:, 0] <= y_max) & (frame_array[:, 1] >= y_min)
+        valid_frames = frame_array[x_condition & y_condition]
+        return [fd[int(f[-1])] for f in valid_frames]
 
     def get_minmax(self, img_to_use_at_low_mag: List[Image.Image]) -> List[Dict]:
         """
@@ -500,19 +495,18 @@ class MagPairs:
         :param img_to_use_at_low_mag: List of low-magnification patches to be scaled to high-magnification.
         :return: List of dictionaries containing min/max coordinates for each patch.
         """
-        minmax_list = []
-        for i in img_to_use_at_low_mag:
-            x_range, y_range = i[0][0].size
-            raw_ranges = i[0][1]
-            x_min = raw_ranges[0] * self.scaling_factor
-            x_max = (raw_ranges[0] + x_range) * self.scaling_factor
-            y_min = raw_ranges[1] * self.scaling_factor
-            y_max = (raw_ranges[1] + y_range) * self.scaling_factor
-            logging.debug(
-                f'x_min: {x_min}, x_max: {x_max}, y_min: {y_min}, y_max: {y_max}, '
-                f'x_range: {x_range}, y_range: {y_range}, raw_ranges:{raw_ranges} ')
-            minmax_list.append({'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max, 'x_range': x_range})
-        return minmax_list
+        patch_coords = np.array([i[0][1] for i in img_to_use_at_low_mag])  # Extract (x, y) coordinates
+        x_min = patch_coords[:, 0] * self.scaling_factor
+        y_min = patch_coords[:, 1] * self.scaling_factor
+
+        # Assume fixed patch size since width/height is not available in patch_coords
+        patch_width = self.patch_size * self.scaling_factor
+        patch_height = self.patch_size * self.scaling_factor
+
+        x_max = x_min + patch_width
+        y_max = y_min + patch_height
+
+        return [{'x_min': x_min[i], 'x_max': x_max[i], 'y_min': y_min[i], 'y_max': y_max[i]} for i in range(len(x_min))]
 
     def get_local_dcm_pair(self, dcm, bq_results_df: pd.DataFrame):
         """
