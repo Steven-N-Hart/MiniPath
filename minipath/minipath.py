@@ -1,47 +1,48 @@
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
-import numpy as np
-import logging
-from PIL import Image
-import pydicom
 from pydicom.encaps import generate_pixel_data_frame
-import os
-from google.cloud import storage
-import pandas as pd
-from google.auth.transport.requests import AuthorizedSession
-import google.auth
-from typing import List, Optional, Dict
-import io
 from dotenv import load_dotenv
+from tqdm import tqdm
+from multiprocessing import Pool, shared_memory
 
 load_dotenv()
-
+from .dcm_tools import *
+from sklearn.cluster import KMeans
+from skimage.measure import shannon_entropy
+from skimage.util import view_as_blocks
+import cv2
+import logging
+import io
+import numpy as np
+import pandas as pd
+from PIL import Image
+from typing import List, Dict, Optional
+from .debug_tools import *
 
 class MiniPath:
-    def __init__(self, csv=None, subset: bool = True, max_k: int = 50, explained_variance: float = 0.8,
-                 img_size: int = 256, patch_size: int = 8, min_k: int = 8, km_init: str = 'k-means++',
-                 km_max_iter: int = 300, km_n_init: int = 10):
+    def __init__(self, csv: Optional[str] = None, subset: bool = True, patch_per_cluster: int = 1, max_k: int = 50,
+                 img_size: int = 256, patch_size: int = 8, min_k: int = 8,
+                 km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10):
         """
-        Initialize MiniPath instance.
+        Initializes the MiniPath class with parameters for processing images and clustering.
 
         Args:
-            csv : Path to CSV file containing bq_results data.
-            subset (bool): Flag indicating whether to use a subset of representative patches or all of them.
-            max_k (int): Maximum number of clusters or components to consider in the entropy-based ranking.
-            explained_variance (float): The explained variance threshold for PCA or related dimensionality reduction.
-            img_size (int): Size of the image to process.
-            patch_size (int): Size of the patches to extract from the image.
-            min_k (int): Minimum number of clusters for KMeans.
+            csv (Optional[str]): Path to a CSV file containing metadata for the images.
+            subset (bool): Whether to use a subset of the dataset.
+            patch_per_cluster (int): Number of patches to sample per cluster.
+            max_k (int): Maximum number of clusters.
+            img_size (int): The size of the image.
+            patch_size (int): The size of each patch.
+            min_k (int): Minimum number of clusters.
+            km_init (str): Initialization method for KMeans clustering.
+            km_max_iter (int): Maximum number of iterations for KMeans.
+            km_n_init (int): Number of KMeans initializations to run.
         """
         self.csv = pd.read_csv(csv) if csv else None
         self.subset = subset
-        self.explained_variance = explained_variance
         self.max_k = max_k
         self.min_k = min_k
         self.img_size = img_size
         self.patch_size = patch_size
+        self.patch_per_cluster = patch_per_cluster
 
         # KMeans parameters
         self.km_init = km_init
@@ -55,8 +56,8 @@ class MiniPath:
 
     def get_representatives(self, full_url: str) -> None:
         """
-        Fetch the DICOM image from the provided URL, process the image to get a set of representative patches
-        based on entropy and diversity, and store them for further processing.
+        Fetch the DICOM image from the provided URL, process it to get representative patches,
+        and store them for further use.
 
         Args:
             full_url (str): URL to fetch the DICOM image.
@@ -64,550 +65,491 @@ class MiniPath:
         # Read DICOM image from the web
         dcm = read_dicomweb(full_url)
 
-        # Get image array from DICOM data
-        grid_array = get_single_dcm_img(dcm)
+        # Get image array from the DICOM data
+        image = get_single_dcm_img(dcm)
 
-        # Perform entropy-based ranking of image patches
-        mp = GetEntropy(img=Image.fromarray(grid_array),
-                        max_k=self.max_k,
-                        min_k=self.min_k,
-                        explained_variance=self.explained_variance,
-                        img_size=self.img_size,
-                        patch_size=self.patch_size,
-                        km_init=self.km_init,
-                        km_max_iter=self.km_max_iter,
-                        km_n_init=self.km_n_init)
-        results_dict: Dict = mp.rank_patches_for_diversity()
-
-        # Subset or full image patches based on user preference
-        if self.subset:
-            img_to_use_at_low_mag = [results_dict['patches_with_labels'][x] for x in
-                                     results_dict['closest_samples_idx']]
-        else:
-            img_to_use_at_low_mag = results_dict['patches_with_labels']
+        # Use the ImageEntropySampler to process the image and get representative patches
+        sampler = ImageEntropySampler(image, patch_size=(self.patch_size, self.patch_size),
+                                      top_n=self.max_k, patch_per_cluster=self.patch_per_cluster)
+        selected_patches = sampler.process()
 
         # Store the results
-        self.img_to_use_at_low_mag = img_to_use_at_low_mag
+        self.img_to_use_at_low_mag = selected_patches
         self.low_res_dcm = dcm
+        logging.debug(f"Processed low-resolution DICOM and selected {len(selected_patches)} representative patches.")
 
     def get_high_res(self) -> Optional[List[Image.Image]]:
         """
-        Use the low-resolution DICOM data and its representative patches to retrieve high-resolution images
-        for each representative patch.
+        Retrieve high-resolution images for each representative patch using the low-resolution data.
 
         Returns:
-            Optional[List[Image.Image]]: A list of clean high-magnification frames corresponding to the patches.
+            Optional[List[Image.Image]]: List of high-magnification frames corresponding to the patches.
         """
         if self.low_res_dcm is None or self.img_to_use_at_low_mag is None:
-            raise ValueError("Low resolution DICOM or image patches not initialized. Call get_representatives() first.")
+            raise ValueError("Low-resolution DICOM or image patches not initialized. Call get_representatives() first.")
 
-        # Create MagPairs object to find high-resolution frames matching the low-res patches
-        mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv)
+        # Create a MagPairs object to find high-resolution frames corresponding to low-resolution patches
+        mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv, patch_size=(patch_size,patch_size))
 
-        # Get the clean high magnification frames
+        # Retrieve clean high-magnification frames
         clean_high_mag_frames = mag_pairs.clean_high_mag_frames
 
-        # Store the high-resolution DICOM for future use
+        # Store the high-resolution DICOM for future reference
         self.high_mag_dcm = mag_pairs.high_mag_dcm
+        logging.debug(f"Found {len(clean_high_mag_frames)} high-magnification frames with tissue ")
 
         return clean_high_mag_frames
 
 
-def read_dicom(dcm_input):
-    """
-    Load a DICOM file from a local path or Google Cloud Storage.
-
-    :param dcm_input: Local file path or GCS path.
-    :return: pydicom FileDataset object.
-    """
-    if isinstance(dcm_input, pydicom.dataset.FileDataset):
-        return dcm_input
-    if isinstance(dcm_input, pd.Series):
-        dcm_input = dcm_input.values[0]
-    if isinstance(dcm_input, str):
-        if dcm_input.startswith('gs://'):
-            # Read DICOM from GCS
-            return read_dicom_from_gcs(dcm_input)
-        elif dcm_input.startswith('https://'):
-            return read_dicomweb(dcm_input)
-        else:
-            # Read local DICOM file
-            return pydicom.dcmread(dcm_input)
-    raise f"Could not complete with {dcm_input}"
-
-
-def read_dicomweb(dcm_input):
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    # Creates a requests Session object with the credentials.
-    session = AuthorizedSession(credentials)
-
-    headers = {"Accept": "application/dicom; transfer-syntax=*"}
-    response = session.get(dcm_input, headers=headers)
-    response.raise_for_status()
-    return pydicom.dcmread(io.BytesIO(response.content))
-
-
-def read_dicom_from_gcs(gcs_path):
-    """
-    Read a DICOM file from Google Cloud Storage.
-
-    :param gcs_path: GCS path to the DICOM file.
-    :return: pydicom FileDataset object.
-    """
-    # Split the GCS path to get bucket and file name
-    path_parts = gcs_path.replace('gs://', '').split('/')
-    bucket_name = path_parts[0]
-    file_name = '/'.join(path_parts[1:])
-
-    # Initialize a client and get the bucket
-    try:
-        client = storage.Client()
-        bucket = client.get_bucket(bucket_name)
-        blob = bucket.blob(file_name)
-    except:
-        blob = download_public_file(bucket_name, file_name, gcs_path, local=False)
-    # Download the file as a bytes object
-    dicom_bytes = blob.download_as_bytes()
-
-    # Use pydicom to read the DICOM file from bytes
-    dicom_file = pydicom.dcmread(io.BytesIO(dicom_bytes))
-
-    return dicom_file
-
-
-class GetEntropy:
-    def __init__(self, img: Image.Image, max_k=50, min_k=8, explained_variance=0.8, img_size=256, patch_size=8,
-                 km_init='k-means++',
-                 km_max_iter: int = 300, km_n_init: int = 10):
+class ImageEntropySampler:
+    def __init__(self, image: np.ndarray, patch_size: tuple[int, int] = (8, 8), top_n: int = 10, patch_per_cluster: int = 1,
+                 km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10):
         """
-        Initialize Minipath with an image and calculate its entropy.
+        Initialize the ImageEntropySampler class.
 
-        :param img: PIL Image object in RGB mode.
-        :param img_size: Size to which the image is resized.
-        :param patch_size: Size of each patch.
-        :param explained_variance: Threshold for cumulative explained variance in PCA.
-        :param max_k: Maximum number of clusters to test.
-        :param min_k: Minimum number of clusters to test.
+        Args:
+            image (np.ndarray): The input image in RGB format.
+            patch_size (tuple[int, int]): The size of the patches to extract.
+            top_n (int): The number of top entropy patches to sample.
+            patch_per_cluster (int): Number of patches to sample per cluster.
+            km_init (str): Initialization method for KMeans clustering.
+            km_max_iter (int): Maximum number of iterations for KMeans.
+            km_n_init (int): Number of initializations for KMeans.
         """
-        self.img = img
-        self.max_k = max_k
-        self.min_k = min_k
-        self.explained_variance = explained_variance
-        # Add KMeans parameters
+        self.image = image
+        self.patch_size = patch_size
+        self.top_n = top_n
+        self.patch_per_cluster = patch_per_cluster
         self.km_init = km_init
         self.km_max_iter = km_max_iter
         self.km_n_init = km_n_init
-        # Rank Patches params
-        self.img_size = img_size
-        self.patch_size = patch_size
+
+        self.image_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        self.foreground = None
+        self.entropy_values = []
+        self.patch_coords = []
+        self.patches = None
+
+    def eliminate_background(self) -> np.ndarray:
+        """
+        Remove the background from the image using Otsu's thresholding.
+
+        Returns:
+            np.ndarray: Foreground image with background removed.
+        """
+        _, mask = cv2.threshold(self.image_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        foreground = cv2.bitwise_and(self.image, self.image, mask=mask.astype(np.uint8))
+        plot_fg(foreground)
+        logging.debug("Background eliminated from the image.")
+        return foreground
 
     @staticmethod
-    def entropy_from_histogram(histogram: list[int]) -> float:
+    def pad_image(image: np.ndarray, patch_size: tuple[int, int]) -> np.ndarray:
         """
-        Compute entropy from a histogram.
+        Pad the input image to ensure compatibility with the patch size.
 
-        :param histogram: List of pixel counts.
-        :return: Entropy value.
+        Args:
+            image (np.ndarray): The input image to pad.
+            patch_size (tuple[int, int]): The size of the patches to ensure divisibility.
+
+        Returns:
+            np.ndarray: The padded image.
         """
-        hist_length = sum(histogram)
-        probability = [float(h) / hist_length for h in histogram]
-        return -sum([p * np.log2(p) for p in probability if p != 0])
+        pad_h = (patch_size[0] - (image.shape[0] % patch_size[0])) % patch_size[0]
+        pad_w = (patch_size[1] - (image.shape[1] % patch_size[1])) % patch_size[1]
+        padded_image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant', constant_values=255)
+        logging.debug(f"Image padded from {image.shape} to {padded_image.shape} to fit patch size: {patch_size}.")
+        return padded_image
 
-    def extract_entropy_feature_vector(self, img_patch: Image.Image) -> np.ndarray:
+
+    def pad_to_size(self, pixel_array, target_shape=(256, 256, 3)) -> np.ndarray:
         """
-        Extract entropy-based feature vector from an image patch.
+        Pad the input array to the target shape, padding only to the right and bottom.
 
-        :param img_patch: PIL Image object in RGB mode.
-        :return: Numpy array containing entropy values for each RGB channel.
+        Args:
+            pixel_array (np.ndarray): Input array to pad.
+            target_shape (tuple): Target shape for the array (height, width, channels).
+
+        Returns:
+            np.ndarray: Padded array.
         """
-        if img_patch.mode != 'RGB':
-            raise ValueError('Image patch should be RGB')
+        # Calculate padding needed for height and width
+        height_diff = target_shape[0] - pixel_array.shape[0]
+        width_diff = target_shape[1] - pixel_array.shape[1]
 
-        # Extract histograms for each channel
-        histogram_r = img_patch.histogram()[0:self.img_size]
-        histogram_g = img_patch.histogram()[self.img_size: self.img_size * 2]
-        histogram_b = img_patch.histogram()[self.img_size * 2: self.img_size * 3]
+        # Apply padding only to the right and bottom
+        padded_array = np.pad(
+            pixel_array,
+            ((0, height_diff), (0, width_diff), (0, 0)),  # Pad bottom and right only
+            mode='constant',  # Use constant padding
+            constant_values=255  # Padding value
+        )
 
-        # Compute entropy for each channel
-        entropy_r = self.entropy_from_histogram(histogram_r)
-        entropy_g = self.entropy_from_histogram(histogram_g)
-        entropy_b = self.entropy_from_histogram(histogram_b)
+        # Debug: Check dimensions of padded array
+        logging.debug(f"Original shape: {pixel_array.shape}")
+        logging.debug(f"Padded shape: {padded_array.shape}")
 
-        # Form the feature vector using entropy values
-        feature_vector = np.array([entropy_r, entropy_g, entropy_b])
+        # Save the result as an image with labeled patches
+        save_padded_array_with_labels(padded_array, patch_size=self.patch_size, output_path="test/output_image.png")
 
-        return feature_vector
+        return padded_array
 
-    @staticmethod
-    def determine_optimal_components(self, scaled_features: np.ndarray) -> int:
+    def process_patches(self):
+        """Divide the image into patches and calculate entropy."""
+        # Debug: Log dimensions before patching
+        logging.debug(f"Foreground shape before patching: {self.foreground.shape}")
+        logging.debug(f"Patch size: {self.patch_size}")
+
+        self.patches = view_as_blocks(self.foreground, block_shape=(self.patch_size[0], self.patch_size[1], 3))
+
+        # Debug: Check the grid dimensions
+        num_rows, num_cols = self.patches.shape[:2]
+        logging.debug(f"Patch grid dimensions: {num_rows} rows x {num_cols} cols")
+
+        entropy_results = []
+        coords_results = []
+
+        # Flatten the loop for better efficiency
+        for i, j in np.ndindex(self.patches.shape[:2]):
+            patch = self.patches[i, j]  # Extract the patch directly
+            # Skip if background
+            if np.mean(patch) > 220:
+                continue
+            entropy = self.calculate_entropy(patch)
+            entropy_results.append(entropy)
+            coords_results.append((i, j))
+
+        self.entropy_values = np.array(entropy_results)
+        self.patch_coords = coords_results
+
+        # Debug: Check calculated entropy values and patch coordinates
+        logging.debug(f"Calculated entropy for {len(self.entropy_values)} patches.")
+
+    def cluster_and_sample(self):
+        """Cluster patches by entropy and sample representative patches."""
+        # Debug: Log number of entropy values before clustering
+        logging.debug(f"Number of patches before clustering: {len(self.entropy_values)}")
+
+        if self.top_n >= len(self.entropy_values):
+            return [(self.patches[i, j], (i, j)) for i, j in self.patch_coords]
+
+        # Perform clustering
+        kmeans = KMeans(n_clusters=self.top_n, init=self.km_init, max_iter=self.km_max_iter, n_init=self.km_n_init)
+        cluster_labels = kmeans.fit_predict(self.entropy_values.reshape(-1, 1))
+
+        logging.debug(f'Found {len(set(cluster_labels))} cluster labels')
+
+        sampled_patches = []
+        for cluster in range(self.top_n):
+            cluster_indices = np.where(cluster_labels == cluster)[0]
+            selected_indices = np.random.choice(cluster_indices, size=min(self.patch_per_cluster, len(cluster_indices)),
+                                                replace=False)
+            for idx in selected_indices:
+                col, row = self.patch_coords[idx]
+                patch = self.patches[col, row]  # Extract the patch directly
+                # Ensure the patch has the correct shape
+                if len(patch.shape) > 3:
+                    patch = patch.squeeze()
+                sampled_patches.append((Image.fromarray(patch), (row, col), idx))
+
+        # Debug: Log sampled patches and their coordinates
+        logging.debug(f"Sampled patches: {[(pos, idx) for _, pos, idx in sampled_patches]}")
+        save_padded_array_with_coords(self.foreground, patch_size=self.patch_size,
+                                      output_path="test/highlighted_image.png",
+                                      patch_coords=self.patch_coords)
+
+        """for img, pos, idx in sampled_patches:
+            img.save(f'test/{pos[0]}_{pos[1]}.png')"""
+        return sampled_patches
+
+    def calculate_entropy(self, patch: np.ndarray) -> float:
         """
-        Determine the optimal number of PCA components.
+        Calculate the entropy of a grayscale patch.
 
-        :param scaled_features: Scaled feature matrix.
-        :return: Optimal number of components.
+        Args:
+            patch (np.ndarray): The patch for which entropy is calculated.
+
+        Returns:
+            float: Entropy value of the patch.
         """
-        pca = PCA()
-        pca.fit(scaled_features)
-        cum_exp_variance = np.cumsum(pca.explained_variance_ratio_)
-        n_components = np.argmax(cum_exp_variance > self.explained_variance) + 1  # +1 because index starts from 0
-        if n_components < 2:
-            n_components = 2  # Require at least 2 components
-        logging.debug(f'n_components: {n_components}, cum_exp_variance: {cum_exp_variance}')
-        return n_components
+        if len(patch.shape) == 4 and patch.shape[0] == 1:  # Handle (1, H, W, C) case
+            patch = patch[0]
+        patch_gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+        return shannon_entropy(patch_gray)
 
-    @staticmethod
-    def calculate_euclidean(pca_features: np.ndarray, centroids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Calculate Euclidean distances between PCA features and centroids.
+    def process(self):
+        """Run the entire processing pipeline."""
+        # Eliminate background
+        self.foreground = self.eliminate_background()
 
-        :param pca_features: Numpy array of PCA features.
-        :param centroids: Numpy array of centroid coordinates.
-        :return: Indices of the closest samples and ordered sample indices.
-        """
-        distances = np.linalg.norm(pca_features - centroids[:, np.newaxis], axis=2)
-        closest_samples_idx = np.argmin(distances, axis=1)
-        ordered_samples_idx = np.argsort(np.sum(distances, axis=0))
-        return closest_samples_idx, ordered_samples_idx
+        # Debug: Log shape after background elimination
+        logging.debug(f"Foreground shape after background elimination: {self.foreground.shape}")
 
-    @staticmethod
-    def determine_optimal_clusters(self, features: np.ndarray) -> int:
-        """
-        Determine the optimal number of clusters using the elbow method.
+        # Pad the image
+        #self.foreground = self.pad_to_size(self.foreground, target_shape=(256, 256, 3))
+        self.foreground = self.pad_image(self.foreground, patch_size=self.patch_size)
 
-        :param features: Feature matrix.
-        :return: Optimal number of clusters.
-        """
-        num_unique_data_points = len(set(tuple(row) for row in features))
+        # Process patches
+        self.process_patches()
 
-        if num_unique_data_points <= 2:
-            # If all data points are the same, or there are too few points to form clusters, return 2
-            return 2
-
-        wcss = []
-
-        for i in range(2, min(self.max_k, num_unique_data_points + 1)):  # Start from 2 to ensure at least 2 clusters
-            kmeans = KMeans(n_clusters=i, init=self.km_init, max_iter=self.km_max_iter, n_init=self.km_n_init,
-                            random_state=0)
-            kmeans.fit(features)
-            wcss.append(kmeans.inertia_)
-
-        if len(wcss) < 2:
-            # If we don't have enough WCSS values to calculate the elbow, return the minimum possible number of clusters
-            return 2
-
-        distances = []
-        for i in range(len(wcss)):
-            x = i + 1  # +1 because the range of ks starts from 1
-            y = wcss[i]
-            a = (wcss[-1] - wcss[0]) / len(wcss)  # Slope of the line
-            b = wcss[0]  # Intercept
-            distance = abs(a * x - y + b) / np.sqrt(a ** 2 + 1)  # Distance formula from a point to a line
-            distances.append(distance)
-
-        if not distances:
-            # If no distances were calculated, return the smallest number of clusters
-            return 2
-
-        elbow_k = distances.index(max(distances)) + 2  # Adjusted to start from 2 clusters
-
-        return elbow_k
-
-    def rank_patches_for_diversity(self) -> dict:
-        """
-        Rank patches for diversity using clustering and PCA.
-
-        :param img_size: Size to which the image is resized.
-        :param patch_size: Size of each patch.
-        :param explained_variance: Threshold for cumulative explained variance in PCA.
-        :param max_k: Maximum number of clusters to test.
-        :param min_k: Minimum number of clusters to test.
-
-        :return: Dictionary containing clustering and PCA results.
-        """
-        # Rescale the image
-        img_resized = self.img.resize((self.img_size, self.img_size))
-        scale_factor_x = self.img.width / self.img_size
-        scale_factor_y = self.img.height / self.img_size
-
-        # Extract patches from the resized image and their coordinates
-        resized_patches = [
-            (img_resized.crop((x, y, x + self.patch_size, y + self.patch_size)), (x, y))
-            for x in range(0, self.img_size, self.patch_size)
-            for y in range(0, self.img_size, self.patch_size)
-        ]
-
-        # Extract patches from the original image and their coordinates
-        original_patches = [
-            (self.img.crop(
-                (int(x * scale_factor_x), int(y * scale_factor_y), int((x + self.patch_size) * scale_factor_x),
-                 int((y + self.patch_size) * scale_factor_y))),
-             (int(x * scale_factor_x), int(y * scale_factor_y)))
-            for x in range(0, self.img_size, self.patch_size)
-            for y in range(0, self.img_size, self.patch_size)
-        ]
-
-        # Extract entropy-based features from patches
-        features = np.array([self.extract_entropy_feature_vector(patch[0]) for patch in resized_patches])
-
-        scaler = StandardScaler()
-        scaled_features = scaler.fit_transform(features)
-
-        # Determine optimal number of PCA components
-        n_components = self.determine_optimal_components(self, scaled_features)
-
-        pca = PCA(n_components=n_components)
-        pca_features = pca.fit_transform(scaled_features)
-
-        # Determine optimal number of clusters
-        n_clusters = self.determine_optimal_clusters(self, pca_features)
-        num_unique_data_points = len(set(tuple(row) for row in features))
-        if num_unique_data_points == 1:
-            return 2
-
-        if n_clusters < self.min_k:
-            n_clusters = self.min_k
-        kmeans = KMeans(n_clusters=n_clusters, init=self.km_init, max_iter=self.km_max_iter, n_init=self.km_n_init,
-                        random_state=0)
-
-        cluster_labels = kmeans.fit_predict(pca_features)
-        closest_samples_idx, ordered_samples_idx = self.calculate_euclidean(pca_features, kmeans.cluster_centers_)
-
-        patches_with_labels = list(zip(original_patches, cluster_labels))
-        patches_with_labels.sort(key=lambda x: x[1])
-
-        silhouette_avg = silhouette_score(pca_features, cluster_labels)
-
-        results = {
-            'patches_with_labels': patches_with_labels,
-            'n_clusters': n_clusters,
-            'n_components': n_components,
-            'closest_samples_idx': closest_samples_idx,
-            'ordered_samples_idx': ordered_samples_idx,
-            'silhouette_avg': silhouette_avg,
-        }
-
-        return results
+        # Cluster and sample patches
+        return self.cluster_and_sample()
 
 
 class MagPairs:
-    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, all_frames=False):
+    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, all_frames=False, patch_size=(8,8)):
         """
-        Initialize MagPairs to extract corresponding high-magnification frames from a low-magnification DICOM image.
+        Initialize the MagPairs object to process DICOM images and extract patches at different magnifications.
 
-        :param low_mag_dcm: Low-magnification DICOM object or path.
-        :param img_to_use_at_low_mag: Patches from low-magnification images to be used for frame extraction.
-        :param bq_results_df: Dataframe containing bq_results for matching DICOM pairs.
-        :param all_frames: Boolean to indicate whether to return all frames or just intersecting frames.
+        Args:
+            low_mag_dcm: Low-magnification DICOM object or path.
+            img_to_use_at_low_mag: List of image patches from low-magnification DICOM to map to high-magnification.
+            bq_results_df: DataFrame containing metadata to pair DICOMs.
+            all_frames: If True, returns all frames without filtering for intersection.
         """
+        self.grid_cols = None
         self.low_mag_dcm = read_dicom(low_mag_dcm)
         self.high_mag_dcm = read_dicom(self.get_local_dcm_pair(low_mag_dcm, bq_results_df))
-        self.low_mag_img = get_single_dcm_img(self.low_mag_dcm)
         self.pixel_spacing_at_low_mag = self.get_pixel_spacing(self.low_mag_dcm)
         self.pixel_spacing_at_high_mag = self.get_pixel_spacing(self.high_mag_dcm)
-        self.scaling_factor = int(self.pixel_spacing_at_low_mag / self.pixel_spacing_at_high_mag)
+        self.scaling_factor = self.pixel_spacing_at_low_mag / self.pixel_spacing_at_high_mag
+
         self.fd = self.get_frame_dict(self.high_mag_dcm)
+
         self.minmax_list = self.get_minmax(img_to_use_at_low_mag)
-        self.high_mag_frame_list = [
-            self.find_intersecting_frames(self.fd, m['x_min'], m['x_max'], m['y_min'], m['y_max'], all_frames) for m in
-            self.minmax_list]
-        self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_frame_list))
-        self.clean_high_mag_frames = [frame for frame in self.high_mag_frames if self.is_foreground(frame['img_array'])]
+        self.high_mag_mappings = self.find_high_mag_mappings()
 
-    @staticmethod
-    def is_foreground(tile) -> bool:
+        self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings))
+        debug_and_save_low_res_with_high_res_coords(self.low_mag_dcm.pixel_array, self.high_mag_mappings, self.scaling_factor, patch_size=patch_size)
+        self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
+        logging.debug(f'From {len(self.high_mag_frames)}, {len(self.clean_high_mag_frames)} had tissue')
+
+        logging.debug("Completed initialization of MagPairs.")
+
+    def find_high_mag_mappings(self):
         """
-        Function to determine if a tile shows mainly tissue (foreground) or background.
-        Returns True if tile shows <= 50% background and False otherwise.
-        """
-        # If tile is in bytes, convert to image
-        if isinstance(tile, bytes):
-            tile = Image.open(io.BytesIO(tile))
-
-        if isinstance(tile, Image.Image):
-            tile = np.array(tile)  # Convert Pillow image to NumPy array
-
-        # Convert to grayscale and threshold
-        grey = np.mean(tile, axis=-1)
-        thresholded = grey < 220
-        return np.mean(thresholded) > 0.5  # True if more than 50% of the tile is foreground
-
-    @staticmethod
-    def frame_extraction(dcm, high_mag_frame_list):
-        try:
-            pixel_array = dcm.pixel_array
-            for high_mag_frame in high_mag_frame_list:
-                for j in high_mag_frame:
-                    frame_id = j['frame']
-                    j['img_array'] = pixel_array[frame_id]
-                    yield j
-        except MemoryError as e:
-            logging.warning("MemoryError: Failed to load the entire pixel array into memory, switching to "
-                            "frame-by-frame loading.")
-            # Generator for individual frames (works for encapsulated formats)
-            frame_generator = generate_pixel_data_frame(dcm.PixelData, dcm.NumberOfFrames)
-
-            for high_mag_frame in high_mag_frame_list:
-                for j in high_mag_frame:
-                    frame_id = j['frame']
-
-                    # Fetch specific frame data without loading the entire pixel array
-                    for i, frame_data in enumerate(frame_generator):
-                        if i == frame_id:
-                            if isinstance(frame_data, bytes):
-                                img = Image.open(io.BytesIO(frame_data))
-                                frame_data = np.array(img)
-                            j['img_array'] = frame_data  # Assign frame data to img_array
-                            yield j
-                            break
-
-    @staticmethod
-    def get_local_name(gcs_url, data_dir):
-        blob = '/'.join(gcs_url.values[0].split('/')[3:])
-        return os.path.join(data_dir, blob)
-
-    @staticmethod
-    def find_intersecting_frames(fd, x_min, x_max, y_min, y_max, all_frames):
-        """
-        Find all frames that intersect with the given coordinates.
-
-        Parameters:
-        - fd: List of dictionaries with frame data containing 'row_min', 'row_max', 'col_min', 'col_max', and 'frame'.
-        - x_min, x_max: x-coordinate range to check for intersection.
-        - y_min, y_max: y-coordinate range to check for intersection.
-        - all_frames: whether or not to return all frames, regardless of intersecting coordinates. (i.e. no filtering)
+        Map low-magnification patches to high-magnification frames and pixel ranges.
 
         Returns:
-        - List of dictionaries that intersect with the given coordinates.
+            list: List of mappings for each low-mag patch.
         """
-        intersecting_frames = []
+        high_res_mappings = []
+        for idx, patch in enumerate(self.minmax_list):
+            mapping = self.map_to_high_mag_with_frames(
+                patch,  # Low-res patch coordinates
+                self.fd,  # High-res frame dictionary
+                self.scaling_factor
+            )
+            high_res_mappings.append(mapping)
+            logging.debug(f"Mapped patch {idx} to frames {mapping['frame_numbers']} with pixels {mapping['high_pixel_range']}")
+        return high_res_mappings
 
-        for frame_data in fd:
-            row_min = frame_data['row_min']
-            row_max = frame_data['row_max']
-            col_min = frame_data['col_min']
-            col_max = frame_data['col_max']
-
-            # Check for intersection in both x and y ranges
-            if (x_min <= col_max and x_max >= col_min) and (y_min <= row_max and y_max >= row_min) or all_frames:
-                intersecting_frames.append(frame_data)
-
-        return intersecting_frames
-
-    def get_minmax(self, img_to_use_at_low_mag: List[Image.Image]) -> List[Dict]:
+    @staticmethod
+    def map_to_high_mag_with_frames(low_res_coords, high_res_frame_dict, scaling_factor):
         """
-        Get the minimum and maximum x, y coordinates for each image patch at low magnification.
+        Map low-resolution patch pixel coordinates to corresponding high-resolution frames and pixel ranges.
 
-        :param img_to_use_at_low_mag: List of low-magnification patches to be scaled to high-magnification.
-        :return: List of dictionaries containing min/max coordinates for each patch.
-        """
-        minmax_list = []
-        for i in img_to_use_at_low_mag:
-            x_range, y_range = i[0][0].size
-            raw_ranges = i[0][1]
-            x_min = raw_ranges[0] * self.scaling_factor
-            x_max = (raw_ranges[0] + x_range) * self.scaling_factor
-            y_min = raw_ranges[1] * self.scaling_factor
-            y_max = (raw_ranges[1] + y_range) * self.scaling_factor
-            logging.debug(
-                f'x_min: {x_min}, x_max: {x_max}, y_min: {y_min}, y_max: {y_max}, '
-                f'x_range: {x_range}, y_range: {y_range}, raw_ranges:{raw_ranges} ')
-            minmax_list.append({'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max, 'x_range': x_range})
-        return minmax_list
+        Args:
+            low_res_coords (dict):
+                Dictionary with 'x_min', 'y_min', 'x_max', 'y_max' in low-resolution pixel coordinates.
+            high_res_frame_dict (list of dict):
+                High-resolution frame metadata containing pixel ranges.
+            scaling_factor (float):
+                Scaling factor between low-res and high-res.
 
-    def get_local_dcm_pair(self, dcm, bq_results_df: pd.DataFrame):
+        Returns:
+            dict: Mapping with high-res pixel ranges and intersecting frames.
         """
-        Retrieve the paired high-magnification DICOM file based on the SeriesInstanceUID from the low-mag DICOM.
+        # Scale low-res pixel ranges to high-res
+        high_x_min = int(low_res_coords['x_min'] * scaling_factor)
+        high_y_min = int(low_res_coords['y_min'] * scaling_factor)
+        high_x_max = int(low_res_coords['x_max'] * scaling_factor)
+        high_y_max = int(low_res_coords['y_max'] * scaling_factor)
 
-        :param dcm: Low-magnification DICOM object.
-        :param bq_results_df: Dataframe containing DICOM metadata to find matching high-mag DICOM.
-        :return: High-magnification DICOM object.
+        # Debug: Validate the scaled ranges
+        logging.debug(f"Low-res pixels: {low_res_coords}")
+
+        # Initialize mapping result
+        mapping_result = {
+            'high_pixel_range': {
+                'x_min': high_x_min,
+                'y_min': high_y_min,
+                'x_max': high_x_max,
+                'y_max': high_y_max
+            },
+            'frame_numbers': [],
+            'row_col': []
+        }
+
+        # Find intersecting frames in the high-res frame dictionary
+        for frame in high_res_frame_dict:
+            if (high_x_min <= frame['row_max'] and high_x_max >= frame['row_min'] and
+                    high_y_min <= frame['col_max'] and high_y_max >= frame['col_min']):
+                mapping_result['frame_numbers'].append(frame['frame'])
+                mapping_result['row_col'].append(frame['row_col'])
+
+        logging.debug(
+            f"High-res pixels: x_min={high_x_min}, y_min={high_y_min}, x_max={high_x_max}, y_max={high_y_max}, row_col={mapping_result['row_col']}")
+        # Warn if no frames were found
+        if not mapping_result['frame_numbers']:
+            logging.warning(f"No intersecting frames found for low-res coords {low_res_coords}")
+
+        return mapping_result
+
+    @staticmethod
+    def frame_extraction(dcm, high_mag_mappings, batch_size=10):
         """
+        Extract frames from DICOM data using shared memory and batch processing.
+
+        Args:
+            dcm: DICOM object containing PixelData and frame information.
+            high_mag_mappings: List of mappings with high-resolution frames and pixel ranges.
+            batch_size: Number of frames to process in a single batch.
+
+        Returns:
+            List of dictionaries with extracted frames as NumPy arrays.
+        """
+        # Create shared memory for PixelData
+        pixel_data = np.frombuffer(dcm.PixelData, dtype=np.uint8)
+        shared_mem = shared_memory.SharedMemory(create=True, size=pixel_data.nbytes)
+        shared_pixel_data = np.ndarray(pixel_data.shape, dtype=pixel_data.dtype, buffer=shared_mem.buf)
+        np.copyto(shared_pixel_data, pixel_data)
+
+        # Flatten the frame list for batching
+        frame_tasks = [
+            {
+                'shared_mem_name': shared_mem.name,
+                'total_frames': dcm.NumberOfFrames,
+                'frame_id': frame,
+                'task_index': idx
+            }
+            for idx, mapping in enumerate(high_mag_mappings)
+            for frame in mapping['frame_numbers']
+        ]
+
+        # Initialize tqdm for progress tracking
+        results = []
+        with tqdm(total=len(frame_tasks), desc="Extracting Frames", unit="frame") as pbar:
+            with Pool() as pool:
+                for i in range(0, len(frame_tasks), batch_size):
+                    batch = frame_tasks[i:i + batch_size]
+                    batch_results = pool.map(MagPairs.process_frame_batch, batch)
+                    results.extend(batch_results)
+                    pbar.update(len(batch))
+
+        # Clean up shared memory
+        shared_mem.close()
+        shared_mem.unlink()
+
+        logging.info(f"Extracted {len(results)} frames with tissue.")
+        return results
+
+    @staticmethod
+    def process_frame_batch(task):
+        """
+        Process a single frame using shared memory.
+
+        Args:
+            task: Task dictionary containing shared memory name, frame_id, and metadata.
+
+        Returns:
+            Extracted frame as a NumPy array.
+        """
+        shared_mem = shared_memory.SharedMemory(name=task['shared_mem_name'])
+        shared_pixel_data = np.ndarray((shared_mem.size,), dtype=np.uint8, buffer=shared_mem.buf)
+
+        frame_id = task['frame_id']
+        total_frames = task['total_frames']
+
+        frame_generator = generate_pixel_data_frame(shared_pixel_data.tobytes(), total_frames)
+        for i, frame_data in enumerate(frame_generator):
+            if i == frame_id:
+                try:
+                    img = Image.open(io.BytesIO(frame_data))
+                    img_arr = np.array(img)
+                    if np.mean(img_arr) < 220:
+                        return img_arr
+                    break
+                except Exception as e:
+                    logging.error(f"Failed to decode frame {frame_id}: {e}")
+
+
+    @staticmethod
+    def get_local_dcm_pair(dcm, bq_results_df):
         gcs_url_pair = bq_results_df['gcs_url'][
-            (bq_results_df['SeriesInstanceUID'] == dcm.SeriesInstanceUID) & (bq_results_df['row_num_desc'] == 1)]
-        # local_pair_name = self.get_local_name(gcs_url_pair, data_dir)
+            (bq_results_df['SeriesInstanceUID'] == dcm.SeriesInstanceUID) &
+            (bq_results_df['row_num_desc'] == 1)
+        ]
         return read_dicom(gcs_url_pair)
 
     @staticmethod
-    def get_pixel_spacing(dcm) -> float:
-        """
-        Retrieve the pixel spacing from a DICOM object.
-
-        :param dcm: DICOM object.
-        :return: Pixel spacing as a float.
-        """
+    def get_pixel_spacing(dcm):
         return float(dcm.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0])
 
-    @staticmethod
-    def get_frame_dict(dcm_input) -> List[Dict]:
-        """
-        Get a list of dictionaries containing frame information (min/max row and column values).
-
-        :param dcm_input: DICOM object.
-        :return: List of dictionaries for each frame.
-        """
+    def get_frame_dict(self, dcm_input):
         dcm, total_pixel_matrix_columns, total_pixel_matrix_rows, columns, rows, grid_rows, grid_cols = parse_dcm_info(
-            dcm_input)
-        frame_list = list()
-        frame_index = 0
+            dcm_input
+        )
+        frame_list = []
+        self.grid_cols = grid_cols  # Store grid_cols for later use if needed
+
         for row in range(grid_rows):
             for col in range(grid_cols):
-                frame_list.append({'row_min': row * rows, 'row_max': row * rows + rows, 'col_min': col * columns,
-                                   'col_max': col * columns + columns, 'frame': frame_index})
-                frame_index += 1
+                frame_index = row * grid_cols + col + 1  # Correct frame numbering
+                # Adjust for edge frames
+                row_min = row * rows
+                row_max = min((row + 1) * rows, total_pixel_matrix_rows)  # Ensure row_max doesn't exceed matrix height
+                col_min = col * columns
+                col_max = min((col + 1) * columns, total_pixel_matrix_columns)
+
+                frame_list.append({
+                    'row_min': row_min,
+                    'row_max': row_max,
+                    'col_min': col_min,
+                    'col_max': col_max,
+                    'frame': frame_index,
+                    'row_col': (row, col)
+                })
 
         return frame_list
 
 
-def get_single_dcm_img(dcm_input) -> np.ndarray:
-    """
-    Generate a grid image from a multi-frame DICOM object.
+    def get_minmax(self, img_to_use_at_low_mag):
+        """
+        Calculate pixel ranges for patches in low-resolution image coordinates.
 
-    :param dcm_input: DICOM object containing multiple frames.
-    :return: Numpy array representing the concatenated grid image.
-    """
-    dcm, total_pixel_matrix_columns, total_pixel_matrix_rows, columns, rows, grid_rows, grid_cols = parse_dcm_info(
-        dcm_input)
+        Args:
+            img_to_use_at_low_mag (list of tuple):
+                List of tuples where each tuple contains:
+                - `patch` (PIL.Image.Image): The image patch.
+                - `raw_range` (tuple): The (row, col) position of the patch in the low-resolution image grid.
+                - `idx` (int): The index of the patch.
 
-    frames = dcm.pixel_array
+            patch_size (tuple):
+                The size of each patch (height, width) in pixels.
 
-    if len(frames.shape) == 3:
-        num_frames = 1
-        frame_height, frame_width, channels = frames.shape
-    elif len(frames.shape) == 4:
-        num_frames, frame_height, frame_width, channels = frames.shape
-    else:
-        raise ValueError("Something is wrong with your image shape!")
-
-    if grid_rows * grid_cols != num_frames:
-        raise ValueError(f"Expected {grid_rows * grid_cols} frames, but got {num_frames}")
-
-    # Create an empty array to hold the grid
-    grid_array = np.zeros((grid_rows * frame_height, grid_cols * frame_width, channels), dtype=np.uint8)
-
-    # Populate the grid array using nested loops
-    frame_index = 0
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            if frame_index < num_frames:
-                start_row = row * frame_height
-                end_row = (row + 1) * frame_height
-                start_col = col * frame_width
-                end_col = (col + 1) * frame_width
-                grid_array[start_row:end_row, start_col:end_col, :] = frames[frame_index]
-                frame_index += 1
-
-    return grid_array
+        Returns:
+            list of dict:
+                A list of dictionaries containing the pixel ranges for each patch:
+                - `x_min`, `x_max`: Pixel range along the x-axis (columns).
+                - `y_min`, `y_max`: Pixel range along the y-axis (rows).
+                - `idx`: The index of the patch.
+                - `patch_size`: The size of the patch.
+        """
+        return [
+            {
+                'x_min': raw_range[1] * patch.size[1],  # Convert column to x_min
+                'x_max': (raw_range[1] + 1) * patch.size[1],  # Add patch width
+                'y_min': raw_range[0] * patch.size[0],  # Convert row to y_min
+                'y_max': (raw_range[0] + 1) * patch.size[0],  # Add patch height
+                'idx': idx,  # Preserve the patch index
+                'row_col': raw_range,
+                'patch_size': patch.size  # Include the patch size for reference
+            }
+            for patch, raw_range, idx in img_to_use_at_low_mag
+        ]
 
 
-def parse_dcm_info(dcm_input):
-    dcm = read_dicom(dcm_input)
-    # Extract necessary metadata
-    total_pixel_matrix_columns = dcm.TotalPixelMatrixColumns
-    total_pixel_matrix_rows = dcm.TotalPixelMatrixRows
-    columns = dcm.Columns
-    rows = dcm.Rows
 
-    # Calculate grid size
-    grid_cols = int(np.ceil(total_pixel_matrix_columns / columns))
-    grid_rows = int(np.ceil(total_pixel_matrix_rows / rows))
-    return dcm, total_pixel_matrix_columns, total_pixel_matrix_rows, columns, rows, grid_rows, grid_cols
+
+

@@ -7,3 +7,6 @@ pydicom
 python-dotenv
 scikit-learn
 python-dotenv
+opencv-python
+scikit-image
+tqdm
