@@ -8,14 +8,14 @@ from .dcm_tools import *
 from sklearn.cluster import KMeans
 from skimage.measure import shannon_entropy
 from skimage.util import view_as_blocks
-import cv2
 import logging
 import io
 import numpy as np
 import pandas as pd
 from PIL import Image
-from typing import List, Dict, Optional
-from .debug_tools import *
+from typing import List, Optional
+import cv2
+#from .debug_tools import *
 
 class MiniPath:
     def __init__(self, csv: Optional[str] = None, subset: bool = True, patch_per_cluster: int = 1, max_k: int = 50,
@@ -76,7 +76,7 @@ class MiniPath:
         # Store the results
         self.img_to_use_at_low_mag = selected_patches
         self.low_res_dcm = dcm
-        logging.debug(f"Processed low-resolution DICOM and selected {len(selected_patches)} representative patches.")
+        logging.info(f"Processed low-resolution DICOM and selected {len(selected_patches)} representative patches.")
 
     def get_high_res(self) -> Optional[List[Image.Image]]:
         """
@@ -89,7 +89,7 @@ class MiniPath:
             raise ValueError("Low-resolution DICOM or image patches not initialized. Call get_representatives() first.")
 
         # Create a MagPairs object to find high-resolution frames corresponding to low-resolution patches
-        mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv, patch_size=(patch_size,patch_size))
+        mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv, patch_size=(self.patch_size,self.patch_size))
 
         # Retrieve clean high-magnification frames
         clean_high_mag_frames = mag_pairs.clean_high_mag_frames
