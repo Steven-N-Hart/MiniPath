@@ -320,7 +320,7 @@ class MagPairs:
 
         self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings))
         self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
-        logging.debug(f'From {len(self.high_mag_frames)}, {len(self.clean_high_mag_frames)} had tissue')
+        logging.info(f'From {len(self.high_mag_frames)} frames, {len(self.clean_high_mag_frames)} had tissue')
 
         logging.debug("Completed initialization of MagPairs.")
 
@@ -439,7 +439,7 @@ class MagPairs:
         shared_mem.close()
         shared_mem.unlink()
 
-        logging.info(f"Extracted {len(results)} frames with tissue.")
+        logging.debug(f"Extracted {len(results)} frames.")
         return results
 
     @staticmethod

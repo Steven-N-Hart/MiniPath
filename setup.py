@@ -13,7 +13,7 @@ def read_readme(filename):
 
 setup(
     name="minipath",
-    version="0.1.9",
+    version="0.1.10",
     description="A tool for processing and analyzing digital pathology images stored in DICOM format.",
     long_description=read_readme('README.md'),
     long_description_content_type='text/markdown',
@@ -22,5 +22,5 @@ setup(
     license="MIT",
     packages=find_packages(),
     install_requires=parse_requirements('requirements.txt'),
-    python_requires='>=3.7',
+    python_requires='>=3.8',
 )
