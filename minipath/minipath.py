@@ -139,7 +139,7 @@ class ImageEntropySampler:
         """
         _, mask = cv2.threshold(self.image_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         foreground = cv2.bitwise_and(self.image, self.image, mask=mask.astype(np.uint8))
-        plot_fg(foreground)
+        #plot_fg(foreground)
         logging.debug("Background eliminated from the image.")
         return foreground
 
@@ -190,7 +190,7 @@ class ImageEntropySampler:
         logging.debug(f"Padded shape: {padded_array.shape}")
 
         # Save the result as an image with labeled patches
-        save_padded_array_with_labels(padded_array, patch_size=self.patch_size, output_path="test/output_image.png")
+        #save_padded_array_with_labels(padded_array, patch_size=self.patch_size, output_path="test/output_image.png")
 
         return padded_array
 
@@ -254,9 +254,8 @@ class ImageEntropySampler:
 
         # Debug: Log sampled patches and their coordinates
         logging.debug(f"Sampled patches: {[(pos, idx) for _, pos, idx in sampled_patches]}")
-        save_padded_array_with_coords(self.foreground, patch_size=self.patch_size,
-                                      output_path="test/highlighted_image.png",
-                                      patch_coords=self.patch_coords)
+        # save_padded_array_with_coords(self.foreground, patch_size=self.patch_size,
+        # output_path="test/highlighted_image.png", patch_coords=self.patch_coords)
 
         """for img, pos, idx in sampled_patches:
             img.save(f'test/{pos[0]}_{pos[1]}.png')"""
@@ -320,7 +319,6 @@ class MagPairs:
         self.high_mag_mappings = self.find_high_mag_mappings()
 
         self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings))
-        debug_and_save_low_res_with_high_res_coords(self.low_mag_dcm.pixel_array, self.high_mag_mappings, self.scaling_factor, patch_size=patch_size)
         self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
         logging.debug(f'From {len(self.high_mag_frames)}, {len(self.clean_high_mag_frames)} had tissue')
 
