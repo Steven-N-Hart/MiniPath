@@ -3,17 +3,19 @@ import os
 
 # Utility function to read the requirements file
 def parse_requirements(filename):
-    with open(filename, 'r') as file:
+    filepath = os.path.join(os.path.dirname(__file__), filename)
+    with open(filepath, 'r') as file:
         return [line.strip() for line in file if line.strip() and not line.startswith('#')]
 
 # Utility function to read the README file
 def read_readme(filename):
-    with open(filename, 'r', encoding='utf-8') as file:
+    filepath = os.path.join(os.path.dirname(__file__), filename)
+    with open(filepath, 'r', encoding='utf-8') as file:
         return file.read()
 
 setup(
     name="minipath",
-    version="0.1.10",
+    version="0.1.12",
     description="A tool for processing and analyzing digital pathology images stored in DICOM format.",
     long_description=read_readme('README.md'),
     long_description_content_type='text/markdown',
