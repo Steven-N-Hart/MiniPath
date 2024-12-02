@@ -78,27 +78,57 @@ class MiniPath:
         self.low_res_dcm = dcm
         logging.info(f"Processed low-resolution DICOM and selected {len(selected_patches)} representative patches.")
 
-    def get_high_res(self) -> Optional[List[Image.Image]]:
+    def get_high_res(self):
         """
-        Retrieve high-resolution images for each representative patch using the low-resolution data.
+        Retrieve high-resolution images for each representative patch, including both low- and high-mag coordinates.
 
         Returns:
-            Optional[List[Image.Image]]: List of high-magnification frames corresponding to the patches.
+            List[dict]: A list of dictionaries, each containing:
+                        - 'row_min', 'row_max', 'col_min', 'col_max': Low-mag pixel coordinates of the patch.
+                        - 'high_row_min', 'high_row_max', 'high_col_min', 'high_col_max': High-mag pixel coordinates.
+                        - 'frame': Frame index from the DICOM file.
+                        - 'row_col': Grid position of the frame in the high-mag image.
+                        - 'img_array': Extracted image as a NumPy array.
         """
         if self.low_res_dcm is None or self.img_to_use_at_low_mag is None:
             raise ValueError("Low-resolution DICOM or image patches not initialized. Call get_representatives() first.")
 
         # Create a MagPairs object to find high-resolution frames corresponding to low-resolution patches
-        mag_pairs = MagPairs(self.low_res_dcm, img_to_use_at_low_mag=self.img_to_use_at_low_mag, bq_results_df=self.csv, patch_size=(self.patch_size,self.patch_size))
+        mag_pairs = MagPairs(
+            self.low_res_dcm,
+            img_to_use_at_low_mag=self.img_to_use_at_low_mag,
+            bq_results_df=self.csv,
+            patch_size=(self.patch_size, self.patch_size)
+        )
 
         # Retrieve clean high-magnification frames
-        clean_high_mag_frames = mag_pairs.clean_high_mag_frames
+        high_res_frames = mag_pairs.clean_high_mag_frames
+        high_res_patches = []
 
-        # Store the high-resolution DICOM for future reference
-        self.high_mag_dcm = mag_pairs.high_mag_dcm
-        logging.debug(f"Found {len(clean_high_mag_frames)} high-magnification frames with tissue ")
+        # Iterate over mappings and include all relevant frames
+        for mapping in mag_pairs.high_mag_mappings:
+            pixel_range = mapping['high_pixel_range']
+            scaling_factor = mag_pairs.scaling_factor  # Scale from low-mag to high-mag
+            i = 0
+            for frame, (row, col) in zip(mapping['frame_numbers'], mapping['row_col']):
+                # Sequentially access filtered high-resolution frames
+                if i < len(high_res_frames):
+                    img_array = high_res_frames[i]  # Use the sequential index
+                    high_res_patches.append({
+                        'row_min': int(pixel_range['y_min'] * scaling_factor),
+                        'row_max': int(pixel_range['y_max'] * scaling_factor),
+                        'col_min': int(pixel_range['x_min'] * scaling_factor),
+                        'col_max': int(pixel_range['x_max'] * scaling_factor),
+                        'frame': frame,  # DICOM frame number
+                        'row_col': (row, col),  # High-mag grid position
+                        'img_array': img_array  # Corresponding high-res image array
+                    })
+                    i += 1  # Increment sequential index
+                else:
+                    logging.warning(f"Index {i} out of range for high_res_frames.")
 
-        return clean_high_mag_frames
+        logging.debug(f"Generated {len(high_res_patches)} high-resolution patches.")
+        return high_res_patches
 
 
 class ImageEntropySampler:
@@ -471,7 +501,6 @@ class MagPairs:
                 except Exception as e:
                     logging.error(f"Failed to decode frame {frame_id}: {e}")
 
-
     @staticmethod
     def get_local_dcm_pair(dcm, bq_results_df):
         gcs_url_pair = bq_results_df['gcs_url'][
@@ -510,7 +539,6 @@ class MagPairs:
                 })
 
         return frame_list
-
 
     def get_minmax(self, img_to_use_at_low_mag):
         """
