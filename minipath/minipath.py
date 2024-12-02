@@ -103,6 +103,7 @@ class MiniPath:
 
         # Retrieve clean high-magnification frames
         high_res_frames = mag_pairs.clean_high_mag_frames
+        self.high_mag_dcm = mag_pairs.high_mag_dcm
         high_res_patches = []
 
         # Iterate over mappings and include all relevant frames
