@@ -2,6 +2,7 @@ from pydicom.encaps import generate_pixel_data_frame
 from dotenv import load_dotenv
 from tqdm import tqdm
 from multiprocessing import Pool, shared_memory
+import random
 
 load_dotenv()
 from .dcm_tools import *
@@ -327,7 +328,7 @@ class ImageEntropySampler:
 
 
 class MagPairs:
-    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, all_frames=False, patch_size=(8,8)):
+    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, num_high_res_frames=None):
         """
         Initialize the MagPairs object to process DICOM images and extract patches at different magnifications.
 
@@ -335,7 +336,7 @@ class MagPairs:
             low_mag_dcm: Low-magnification DICOM object or path.
             img_to_use_at_low_mag: List of image patches from low-magnification DICOM to map to high-magnification.
             bq_results_df: DataFrame containing metadata to pair DICOMs.
-            all_frames: If True, returns all frames without filtering for intersection.
+            num_high_res_frames: If True, returns all frames without filtering for intersection.
         """
         self.grid_cols = None
         self.low_mag_dcm = read_dicom(low_mag_dcm)
@@ -343,13 +344,12 @@ class MagPairs:
         self.pixel_spacing_at_low_mag = self.get_pixel_spacing(self.low_mag_dcm)
         self.pixel_spacing_at_high_mag = self.get_pixel_spacing(self.high_mag_dcm)
         self.scaling_factor = self.pixel_spacing_at_low_mag / self.pixel_spacing_at_high_mag
-
         self.fd = self.get_frame_dict(self.high_mag_dcm)
 
         self.minmax_list = self.get_minmax(img_to_use_at_low_mag)
         self.high_mag_mappings = self.find_high_mag_mappings()
 
-        self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings))
+        self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings, num_high_res_frames))
         self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
         logging.info(f'From {len(self.high_mag_frames)} frames, {len(self.clean_high_mag_frames)} had tissue')
 
@@ -426,13 +426,14 @@ class MagPairs:
         return mapping_result
 
     @staticmethod
-    def frame_extraction(dcm, high_mag_mappings, batch_size=10):
+    def frame_extraction(dcm, high_mag_mappings, num_high_res_frames, batch_size=10):
         """
         Extract frames from DICOM data using shared memory and batch processing.
 
         Args:
             dcm: DICOM object containing PixelData and frame information.
             high_mag_mappings: List of mappings with high-resolution frames and pixel ranges.
+            num_high_res_frames: Maximum number of frames to extract. If None, extract all frames.
             batch_size: Number of frames to process in a single batch.
 
         Returns:
@@ -455,6 +456,11 @@ class MagPairs:
             for idx, mapping in enumerate(high_mag_mappings)
             for frame in mapping['frame_numbers']
         ]
+
+        # Limit the number of high mag frames
+        # Randomly sample up to max_frames
+        if num_high_res_frames is not None and len(frame_tasks) > num_high_res_frames:
+            frame_tasks = random.sample(frame_tasks, num_high_res_frames)
 
         # Initialize tqdm for progress tracking
         results = []
