@@ -16,12 +16,15 @@ import pandas as pd
 from PIL import Image
 from typing import List, Optional
 import cv2
+
+
 #from .debug_tools import *
 
 class MiniPath:
     def __init__(self, csv: Optional[str] = None, subset: bool = True, patch_per_cluster: int = 1, max_k: int = 50,
                  img_size: int = 256, patch_size: int = 8, min_k: int = 8,
-                 km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10):
+                 km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10,
+                 num_high_res_frames=None):
         """
         Initializes the MiniPath class with parameters for processing images and clustering.
 
@@ -36,6 +39,7 @@ class MiniPath:
             km_init (str): Initialization method for KMeans clustering.
             km_max_iter (int): Maximum number of iterations for KMeans.
             km_n_init (int): Number of KMeans initializations to run.
+            num_high_res_frames (int): Maximum number of frames to extract. If None, extract all frames.
         """
         self.csv = pd.read_csv(csv) if csv else None
         self.subset = subset
@@ -54,6 +58,7 @@ class MiniPath:
         self.img_to_use_at_low_mag: Optional[List[Image.Image]] = None
         self.low_res_dcm = None
         self.high_mag_dcm = None
+        self.num_high_res_frames = num_high_res_frames
 
     def get_representatives(self, full_url: str) -> None:
         """
@@ -83,6 +88,9 @@ class MiniPath:
         """
         Retrieve high-resolution images for each representative patch, including both low- and high-mag coordinates.
 
+        Args:
+            high_res_frames (list): Pre-sampled high-resolution frames.
+
         Returns:
             List[dict]: A list of dictionaries, each containing:
                         - 'row_min', 'row_max', 'col_min', 'col_max': Low-mag pixel coordinates of the patch.
@@ -99,23 +107,20 @@ class MiniPath:
             self.low_res_dcm,
             img_to_use_at_low_mag=self.img_to_use_at_low_mag,
             bq_results_df=self.csv,
+            num_high_res_frames=self.num_high_res_frames,
             patch_size=(self.patch_size, self.patch_size)
         )
 
-        # Retrieve clean high-magnification frames
-        high_res_frames = mag_pairs.clean_high_mag_frames
-        self.high_mag_dcm = mag_pairs.high_mag_dcm
-        high_res_patches = []
-
         # Iterate over mappings and include all relevant frames
+        high_res_patches = []
+        frames_to_keep = [x['frame_id'] for x in mag_pairs.high_mag_frames if x is not None]
         for mapping in mag_pairs.high_mag_mappings:
             pixel_range = mapping['high_pixel_range']
             scaling_factor = mag_pairs.scaling_factor  # Scale from low-mag to high-mag
             i = 0
             for frame, (row, col) in zip(mapping['frame_numbers'], mapping['row_col']):
-                # Sequentially access filtered high-resolution frames
-                if i < len(high_res_frames):
-                    img_array = high_res_frames[i]  # Use the sequential index
+                if frame in frames_to_keep:
+                    img_array = next((f['img_arr'] for f in mag_pairs.clean_high_mag_frames if f['frame_id'] == frame), None)
                     high_res_patches.append({
                         'row_min': int(pixel_range['y_min'] * scaling_factor),
                         'row_max': int(pixel_range['y_max'] * scaling_factor),
@@ -125,16 +130,14 @@ class MiniPath:
                         'row_col': (row, col),  # High-mag grid position
                         'img_array': img_array  # Corresponding high-res image array
                     })
-                    i += 1  # Increment sequential index
-                else:
-                    logging.warning(f"Index {i} out of range for high_res_frames.")
 
         logging.debug(f"Generated {len(high_res_patches)} high-resolution patches.")
         return high_res_patches
 
 
 class ImageEntropySampler:
-    def __init__(self, image: np.ndarray, patch_size: tuple[int, int] = (8, 8), top_n: int = 10, patch_per_cluster: int = 1,
+    def __init__(self, image: np.ndarray, patch_size: tuple[int, int] = (8, 8), top_n: int = 10,
+                 patch_per_cluster: int = 1,
                  km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10):
         """
         Initialize the ImageEntropySampler class.
@@ -192,7 +195,6 @@ class ImageEntropySampler:
         padded_image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant', constant_values=255)
         logging.debug(f"Image padded from {image.shape} to {padded_image.shape} to fit patch size: {patch_size}.")
         return padded_image
-
 
     def pad_to_size(self, pixel_array, target_shape=(256, 256, 3)) -> np.ndarray:
         """
@@ -328,7 +330,8 @@ class ImageEntropySampler:
 
 
 class MagPairs:
-    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, num_high_res_frames=None):
+    def __init__(self, low_mag_dcm, img_to_use_at_low_mag=None, bq_results_df=None, num_high_res_frames=None,
+                 patch_size=(256, 256)):
         """
         Initialize the MagPairs object to process DICOM images and extract patches at different magnifications.
 
@@ -336,7 +339,7 @@ class MagPairs:
             low_mag_dcm: Low-magnification DICOM object or path.
             img_to_use_at_low_mag: List of image patches from low-magnification DICOM to map to high-magnification.
             bq_results_df: DataFrame containing metadata to pair DICOMs.
-            num_high_res_frames: If True, returns all frames without filtering for intersection.
+            num_high_res_frames: Maximum number of frames to extract. If None, extract all frames.
         """
         self.grid_cols = None
         self.low_mag_dcm = read_dicom(low_mag_dcm)
@@ -349,11 +352,22 @@ class MagPairs:
         self.minmax_list = self.get_minmax(img_to_use_at_low_mag)
         self.high_mag_mappings = self.find_high_mag_mappings()
 
-        self.high_mag_frames = list(self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings, num_high_res_frames))
+        self.high_mag_frames = list(
+            self.frame_extraction(self.high_mag_dcm, self.high_mag_mappings, num_high_res_frames))
+
+
         self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
         logging.info(f'From {len(self.high_mag_frames)} frames, {len(self.clean_high_mag_frames)} had tissue')
 
         logging.debug("Completed initialization of MagPairs.")
+
+    def clean_frames(self):
+        #self.high_mag_frames is either None or a tuple (img_arr, Frame_id)
+        rm_hmidx = [i for i, j in enumerate(self.high_mag_frames) if j is None]
+
+        # Find high_mag_frames that don't have tissue
+
+
 
     def find_high_mag_mappings(self):
         """
@@ -370,7 +384,8 @@ class MagPairs:
                 self.scaling_factor
             )
             high_res_mappings.append(mapping)
-            logging.debug(f"Mapped patch {idx} to frames {mapping['frame_numbers']} with pixels {mapping['high_pixel_range']}")
+            logging.debug(
+                f"Mapped patch {idx} to frames {mapping['frame_numbers']} with pixels {mapping['high_pixel_range']}")
         return high_res_mappings
 
     @staticmethod
@@ -460,7 +475,8 @@ class MagPairs:
         # Limit the number of high mag frames
         # Randomly sample up to max_frames
         if num_high_res_frames is not None and len(frame_tasks) > num_high_res_frames:
-            frame_tasks = random.sample(frame_tasks, num_high_res_frames)
+            sampled_indices = random.sample(range(len(frame_tasks)), num_high_res_frames)
+            frame_tasks = [frame_tasks[i] for i in sampled_indices]
 
         # Initialize tqdm for progress tracking
         results = []
@@ -476,7 +492,7 @@ class MagPairs:
         shared_mem.close()
         shared_mem.unlink()
 
-        logging.debug(f"Extracted {len(results)} frames.")
+        logging.debug(f"Extracted {len(results)} high-res frames.")
         return results
 
     @staticmethod
@@ -503,7 +519,7 @@ class MagPairs:
                     img = Image.open(io.BytesIO(frame_data))
                     img_arr = np.array(img)
                     if np.mean(img_arr) < 220:
-                        return img_arr
+                        return {'img_arr':img_arr,'frame_id':frame_id}
                     break
                 except Exception as e:
                     logging.error(f"Failed to decode frame {frame_id}: {e}")
@@ -513,7 +529,7 @@ class MagPairs:
         gcs_url_pair = bq_results_df['gcs_url'][
             (bq_results_df['SeriesInstanceUID'] == dcm.SeriesInstanceUID) &
             (bq_results_df['row_num_desc'] == 1)
-        ]
+            ]
         return read_dicom(gcs_url_pair)
 
     @staticmethod
@@ -581,8 +597,3 @@ class MagPairs:
             }
             for patch, raw_range, idx in img_to_use_at_low_mag
         ]
-
-
-
-
-
