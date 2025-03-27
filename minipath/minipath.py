@@ -16,15 +16,48 @@ import pandas as pd
 from PIL import Image
 from typing import List, Optional
 import cv2
-
-
 #from .debug_tools import *
+
+from multiprocessing import Pool, shared_memory
+from functools import partial
+
+# Define this helper function at the module level.
+def process_high_mag_mapping(mapping, scaling_factor, frames_to_keep, clean_high_mag_frames):
+    """
+    Process a single high-mag mapping to generate high-resolution patches.
+
+    Args:
+        mapping (dict): A single mapping from mag_pairs.high_mag_mappings.
+        scaling_factor (float): Scaling factor to convert low-mag to high-mag coordinates.
+        frames_to_keep (list): List of frame ids that are valid.
+        clean_high_mag_frames (list): List of dictionaries containing high-res frame data.
+
+    Returns:
+        list: A list of dictionaries for high-res patches.
+    """
+    pixel_range = mapping['high_pixel_range']
+    patches = []
+    for frame, (row, col) in zip(mapping['frame_numbers'], mapping['row_col']):
+        if frame in frames_to_keep:
+            # Find the corresponding high-res image array
+            img_array = next((f['img_arr'] for f in clean_high_mag_frames if f['frame_id'] == frame), None)
+            patches.append({
+                'row_min': int(pixel_range['y_min'] * scaling_factor),
+                'row_max': int(pixel_range['y_max'] * scaling_factor),
+                'col_min': int(pixel_range['x_min'] * scaling_factor),
+                'col_max': int(pixel_range['x_max'] * scaling_factor),
+                'frame': frame,  # DICOM frame number
+                'row_col': (row, col),  # High-mag grid position
+                'img_array': img_array  # Corresponding high-res image array
+            })
+    return patches
 
 class MiniPath:
     def __init__(self, csv: Optional[str] = None, subset: bool = True, patch_per_cluster: int = 1, max_k: int = 50,
                  img_size: int = 256, patch_size: int = 8, min_k: int = 8,
                  km_init: str = 'k-means++', km_max_iter: int = 300, km_n_init: int = 10,
-                 num_high_res_frames=None):
+                 num_high_res_frames=500,
+                 processors: int = 4):
         """
         Initializes the MiniPath class with parameters for processing images and clustering.
 
@@ -40,6 +73,7 @@ class MiniPath:
             km_max_iter (int): Maximum number of iterations for KMeans.
             km_n_init (int): Number of KMeans initializations to run.
             num_high_res_frames (int): Maximum number of frames to extract. If None, extract all frames.
+            processors (int): Maximum number of processors to use
         """
         self.csv = pd.read_csv(csv) if csv else None
         self.subset = subset
@@ -59,6 +93,8 @@ class MiniPath:
         self.low_res_dcm = None
         self.high_mag_dcm = None
         self.num_high_res_frames = num_high_res_frames
+
+        self.processors = processors
 
     def get_representatives(self, full_url: str) -> None:
         """
@@ -100,9 +136,10 @@ class MiniPath:
                         - 'img_array': Extracted image as a NumPy array.
         """
         if self.low_res_dcm is None or self.img_to_use_at_low_mag is None:
-            raise ValueError("Low-resolution DICOM or image patches not initialized. Call get_representatives() first.")
+            raise ValueError(
+                "Low-resolution DICOM or image patches not initialized. Call get_representatives() first.")
 
-        # Create a MagPairs object to find high-resolution frames corresponding to low-resolution patches
+            # Create a MagPairs object to find high-resolution frames corresponding to low-resolution patches
         mag_pairs = MagPairs(
             self.low_res_dcm,
             img_to_use_at_low_mag=self.img_to_use_at_low_mag,
@@ -110,30 +147,31 @@ class MiniPath:
             num_high_res_frames=self.num_high_res_frames,
             patch_size=(self.patch_size, self.patch_size)
         )
+        self.high_mag_dcm = mag_pairs.high_mag_dcm
 
-        # Iterate over mappings and include all relevant frames
-        high_res_patches = []
-        frames_to_keep = [x['frame_id'] for x in mag_pairs.high_mag_frames if x is not None]
-        for mapping in mag_pairs.high_mag_mappings:
-            pixel_range = mapping['high_pixel_range']
-            scaling_factor = mag_pairs.scaling_factor  # Scale from low-mag to high-mag
-            i = 0
-            for frame, (row, col) in zip(mapping['frame_numbers'], mapping['row_col']):
-                if frame in frames_to_keep:
-                    img_array = next((f['img_arr'] for f in mag_pairs.clean_high_mag_frames if f['frame_id'] == frame), None)
-                    high_res_patches.append({
-                        'row_min': int(pixel_range['y_min'] * scaling_factor),
-                        'row_max': int(pixel_range['y_max'] * scaling_factor),
-                        'col_min': int(pixel_range['x_min'] * scaling_factor),
-                        'col_max': int(pixel_range['x_max'] * scaling_factor),
-                        'frame': frame,  # DICOM frame number
-                        'row_col': (row, col),  # High-mag grid position
-                        'img_array': img_array  # Corresponding high-res image array
-                    })
+        # Determine which frames to keep
+        frames_to_keep = [x['frame_id'] for x in mag_pairs.high_mag_frames if
+                          x is not None]
+        scaling_factor = mag_pairs.scaling_factor
 
-        logging.debug(f"Generated {len(high_res_patches)} high-resolution patches.")
+        # Use multiprocessing to process each mapping in parallel.
+        with Pool(processes=self.processors) as pool:
+            # Create a partial function with the additional parameters.
+            func = partial(
+                process_high_mag_mapping,
+                scaling_factor=scaling_factor,
+                frames_to_keep=frames_to_keep,
+                clean_high_mag_frames=mag_pairs.clean_high_mag_frames
+            )
+            # Map the helper function over all mappings.
+            results = pool.map(func, mag_pairs.high_mag_mappings)
+
+        # Flatten the list of lists into a single list of high-resolution patches.
+        high_res_patches = [patch for sublist in results for patch in sublist]
+
+        logging.debug(
+            f"Generated {len(high_res_patches)} high-resolution patches.")
         return high_res_patches
-
 
 class ImageEntropySampler:
     def __init__(self, image: np.ndarray, patch_size: tuple[int, int] = (8, 8), top_n: int = 10,
@@ -358,14 +396,8 @@ class MagPairs:
 
         self.clean_high_mag_frames = [x for x in self.high_mag_frames if x is not None]
         logging.info(f'From {len(self.high_mag_frames)} frames, {len(self.clean_high_mag_frames)} had tissue')
-
         logging.debug("Completed initialization of MagPairs.")
 
-    def clean_frames(self):
-        #self.high_mag_frames is either None or a tuple (img_arr, Frame_id)
-        rm_hmidx = [i for i, j in enumerate(self.high_mag_frames) if j is None]
-
-        # Find high_mag_frames that don't have tissue
 
 
 
@@ -530,6 +562,7 @@ class MagPairs:
             (bq_results_df['SeriesInstanceUID'] == dcm.SeriesInstanceUID) &
             (bq_results_df['row_num_desc'] == 1)
             ]
+        logging.debug(f'gcs_url_pair: {gcs_url_pair}')
         return read_dicom(gcs_url_pair)
 
     @staticmethod

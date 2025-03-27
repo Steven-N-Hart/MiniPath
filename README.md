@@ -81,6 +81,12 @@ minipath = MiniPath(csv='path/to/csv_file.csv', subset=True)
   - The number of times the KMeans algorithm will be run with different centroid seeds.
   - KMeans clustering is run multiple times with different initializations, and the best result (in terms of inertia) is kept. A higher value increases reliability at the cost of more computation.
 
+- **`num_high_res_frames = 500`**
+  - Maximum number of frames per slide you want to extract
+  - There is an image content filter, so blanks will be filtered out and you may get fewer than this.
+  - Setting this value to `None` will give you a full complement of the high resolution images in the coordinates of 
+    the low resolution set. 
+
 
 ### Get Representative Patches
 ```python

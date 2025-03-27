@@ -1,3 +1,9 @@
+# v0.1.17
+* Added multi-processing
+
+# v0.1.16
+* Added Maximum to image patches
+
 # v0.1.14
 * Fixed bug that didn't connect the high mag dicom to object
 
